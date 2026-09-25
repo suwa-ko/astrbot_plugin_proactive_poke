@@ -32,6 +32,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import random
 import time
 from collections import deque
@@ -65,6 +66,14 @@ RATE_WINDOW_SECONDS = 3600
 
 SEND_TIMEOUT_SECONDS = 5.0
 """单次戳一戳调用的超时上限，避免拖慢正在发送的回复。"""
+
+CONFIRM_TIMEOUT_SECONDS = 3.0
+"""等待协议端回传「戳一戳已发出」事件的秒数。
+
+NapCat 的 poke 接口只要包发出去了就返回成功，**成功不等于对方收到**
+（对方屏蔽、非好友、服务端丢弃都可能）。唯一可靠的反馈是协议端随后上报的 poke 事件，
+而且机器人自己发的戳也会上报，所以可以用它做送达确认。
+"""
 
 
 def _as_int(value: Any) -> Any:
@@ -115,10 +124,20 @@ def _explain_poke_error(exc: BaseException | None) -> str:
 
 @dataclass(frozen=True)
 class PokeOutcome:
-    """一次戳一戳的结果。"""
+    """一次戳一戳的结果。
+
+    注意区分三件事，它们不是一回事：
+
+    - ``ok``：流程走通了（没被冷却/上限拦住，接口也没报错）
+    - ``sent``：真的发出去了。``dry_run`` 模式下为 False —— **不能把 dry-run 当成成功**
+    - ``confirmed``：协议端有没有回传「这个戳发出去了」的事件。
+      ``None`` 表示没等确认，``True``/``False`` 是确认结果。
+    """
 
     ok: bool
     detail: str
+    sent: bool = True
+    confirmed: bool | None = None
 
 
 @dataclass
@@ -152,6 +171,9 @@ class ProactivePokePlugin(Star):
         # 独立 Random 实例，方便测试里替换成确定性实现
         self._rng = random.Random()
         self._logged_send_method: str | None = None
+        # 送达确认：目标 QQ -> 等待被协议端事件点亮的 Future
+        self._pending_confirms: dict[str, asyncio.Future[bool]] = {}
+        self._confirm_tasks: set[asyncio.Task[Any]] = set()
 
     # -------------------------------------------------------------- 配置读取
 
@@ -381,6 +403,84 @@ class ProactivePokePlugin(Star):
             self._logged_send_method = method
             logger.info(f"戳一戳发送方式确定: {method}")
 
+    # ------------------------------------------------------------ 送达确认
+
+    def _arm_confirm(self, target: str) -> asyncio.Future[bool]:
+        """登记一个「等这个目标被戳」的确认点。"""
+        old = self._pending_confirms.get(target)
+        if old is not None and not old.done():
+            old.cancel()
+        fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self._pending_confirms[target] = fut
+        return fut
+
+    def _resolve_confirm(self, target: str) -> bool:
+        """协议端回传了「戳了 target」，点亮确认点。"""
+        fut = self._pending_confirms.get(target)
+        if fut is None or fut.done():
+            return False
+        fut.set_result(True)
+        return True
+
+    async def _await_confirm(self, target: str, fut: asyncio.Future[bool]) -> bool:
+        """等确认事件；等到返回 True，超时返回 False。"""
+        try:
+            await asyncio.wait_for(fut, CONFIRM_TIMEOUT_SECONDS)
+            logger.info(f"戳一戳送达已确认: {target}")
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"戳一戳接口调用成功，但 {CONFIRM_TIMEOUT_SECONDS:.0f} 秒内没收到送达事件: "
+                f"{target}。可能并没有真的发出去（对方屏蔽戳一戳 / 非好友 / "
+                f"协议端 packetBackend 异常），请自行确认。"
+            )
+            return False
+        finally:
+            if self._pending_confirms.get(target) is fut:
+                self._pending_confirms.pop(target, None)
+
+    @staticmethod
+    def _parse_poke_notice(event: AstrMessageEvent) -> tuple[str, str] | None:
+        """从 poke 通知里取出 ``(戳的人, 被戳的人)``；不是 poke 通知就返回 None。
+
+        字段含义（NapCat 的 ``OB11GroupPokeEvent`` / ``OB11FriendPokeEvent``）：
+
+        - 群聊：``user_id`` = 戳的人，``target_id`` = 被戳的人
+        - 私聊：``sender_id`` = 戳的人，``user_id`` = 会话对端（可能正是被戳的人），
+          ``target_id`` = 被戳的人
+        """
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        get = getattr(raw, "get", None)
+        if not callable(get):
+            return None
+        try:
+            if get("post_type") != "notice" or get("notice_type") != "notify":
+                return None
+            if get("sub_type") != "poke":
+                return None
+            pokee = str(get("target_id") or "").strip()
+            poker = str(get("sender_id") or get("user_id") or "").strip()
+        except Exception:
+            return None
+        if not poker or not pokee or pokee == "0":
+            return None
+        return poker, pokee
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def watch_poke_delivery(self, event: AstrMessageEvent) -> None:
+        """观察 poke 通知，确认机器人自己发出的戳一戳有没有真的送出去。
+
+        这个 handler 只读不写：不停止事件、不发消息，纯粹用来点亮送达确认。
+        """
+        info = self._parse_poke_notice(event)
+        if info is None:
+            return
+        poker, pokee = info
+        if poker != str(event.get_self_id() or ""):
+            return  # 不是机器人自己发的戳
+        self._resolve_confirm(pokee)
+
     async def _deliver(self, event: AstrMessageEvent, target: str) -> PokeOutcome:
         """真正把戳一戳发出去。
 
@@ -428,12 +528,20 @@ class ProactivePokePlugin(Star):
         return role in ("owner", "admin")
 
     async def _try_poke(
-        self, event: AstrMessageEvent, target: str, scenario: str
+        self,
+        event: AstrMessageEvent,
+        target: str,
+        scenario: str,
+        *,
+        wait_confirm: bool = False,
     ) -> PokeOutcome:
         """所有场景的唯一出口：做完全部检查再发送。
 
         Args:
             scenario: ``before_reply`` / ``on_silent`` / ``by_llm``，决定用哪一组冷却配置。
+            wait_confirm: 是否阻塞等待协议端的送达确认。
+                LLM 工具要等（它得如实回答「戳成功了没」），
+                自动场景不等（不能为了确认拖慢正在发送的回复），改成后台确认并记日志。
         """
         target = str(target or "").strip()
         self_id = str(event.get_self_id() or "").strip()
@@ -493,21 +601,35 @@ class ProactivePokePlugin(Star):
             logger.info(
                 f"[dry-run] 本该戳 {target}（场景={scenario}, 群={event.get_group_id() or '私聊'}）"
             )
-            return PokeOutcome(True, "dry-run，未真的发送")
+            # ⚠️ sent=False：dry-run 只是「演练」，绝不能对外报告成戳成功了
+            return PokeOutcome(
+                True, "[dry-run] 只记日志，没有真的发送", sent=False
+            )
 
         try:
             outcome = await self._deliver(event, target)
         except Exception as exc:  # 兜底，绝不让插件异常冒到框架
             outcome = PokeOutcome(False, str(exc)[:200])
 
-        if outcome.ok:
-            state.pokes.append(now)
-            self._stamp(state, target, scenario, now)
-            logger.info(
-                f"戳了 {target}（场景={scenario}, 群={event.get_group_id() or '私聊'}）"
-            )
-        else:
+        if not outcome.ok:
             logger.warning(f"戳 {target} 失败（场景={scenario}）: {outcome.detail}")
+            return outcome
+
+        state.pokes.append(now)
+        self._stamp(state, target, scenario, now)
+        logger.info(
+            f"戳了 {target}（场景={scenario}, 群={event.get_group_id() or '私聊'}）"
+        )
+
+        # 接口成功只是「包发出去了」。用协议端回传的 poke 事件确认是否真的送出去。
+        fut = self._arm_confirm(target)
+        if wait_confirm:
+            confirmed = await self._await_confirm(target, fut)
+            return PokeOutcome(True, outcome.detail, sent=True, confirmed=confirmed)
+
+        task = asyncio.create_task(self._await_confirm(target, fut))
+        self._confirm_tasks.add(task)
+        task.add_done_callback(self._confirm_tasks.discard)
         return outcome
 
     @staticmethod
@@ -651,14 +773,36 @@ class ProactivePokePlugin(Star):
                 "或者本条消息 @ 到的人的昵称。"
             )
 
-        outcome = await self._try_poke(event, resolved, "by_llm")
-        if outcome.ok:
-            note = f"（原因：{reason.strip()}）" if reason and reason.strip() else ""
-            return f"已经戳了 {resolved}。{note}"
-        return f"这次没戳成：{outcome.detail}"
+        outcome = await self._try_poke(event, resolved, "by_llm", wait_confirm=True)
+        note = f"（原因：{reason.strip()}）" if reason and reason.strip() else ""
+
+        if not outcome.ok:
+            return f"这次没戳成：{outcome.detail}"
+        if not outcome.sent:
+            # ⚠️ dry-run 只是演练，必须如实告诉 LLM，否则它会跟用户说「已经戳了」
+            return (
+                f"当前是 dry-run 演练模式，**没有真的戳** {resolved}（只写了日志）。"
+                f"请告诉用户：插件当前只演练不发送，需要管理员关掉「只记日志不真的戳」才会真的戳。"
+            )
+        if outcome.confirmed is False:
+            return (
+                f"接口调用成功了，但 {CONFIRM_TIMEOUT_SECONDS:.0f} 秒内没收到戳一戳送达事件，"
+                f"所以**不能确定真的戳到** {resolved}（对方可能屏蔽了戳一戳、不是好友，"
+                f"或者协议端根本没发出去）。请如实告诉用户「调用了但不确定成功」。"
+            )
+        return f"已经戳了 {resolved}，并收到了送达确认。{note}"
 
     # ---------------------------------------------------------------- 收尾
 
     async def terminate(self):
-        """插件卸载时清掉状态。"""
+        """插件卸载时清掉状态与后台任务。"""
+        for task in list(self._confirm_tasks):
+            task.cancel()
+        if self._confirm_tasks:
+            await asyncio.gather(*self._confirm_tasks, return_exceptions=True)
+        self._confirm_tasks.clear()
+        for fut in list(self._pending_confirms.values()):
+            if not fut.done():
+                fut.cancel()
+        self._pending_confirms.clear()
         self._sessions.clear()
