@@ -1,0 +1,143 @@
+{
+  "poke_before_reply": {
+    "description": "场景一：回复前戳一戳",
+    "type": "object",
+    "hint": "机器人准备回复某人之前，按概率先戳他一下。一轮对话只会戳一次。",
+    "items": {
+      "enable": {
+        "description": "启用",
+        "type": "bool",
+        "default": true
+      },
+      "probability": {
+        "description": "触发概率",
+        "type": "float",
+        "default": 0.3,
+        "hint": "0~1。建议 0.1~0.4，太高会显得很烦。"
+      },
+      "round_window": {
+        "description": "同一轮对话的间隔（秒）",
+        "type": "int",
+        "default": 300,
+        "hint": "戳过一次后，这个会话在这么多秒内不会再戳——用时间来界定「一轮完整对话」。"
+      }
+    }
+  },
+  "poke_on_silent": {
+    "description": "场景二：不回复时戳一戳",
+    "type": "object",
+    "hint": "群里有人发言但没有触发机器人回复时，用更低的概率戳他一下。注意：只有群里才有效（私聊的消息总会唤醒机器人）。",
+    "items": {
+      "enable": {
+        "description": "启用",
+        "type": "bool",
+        "default": true
+      },
+      "probability": {
+        "description": "触发概率",
+        "type": "float",
+        "default": 0.05,
+        "hint": "0~1。建议明显低于场景一（0.02~0.08）。"
+      },
+      "user_cooldown": {
+        "description": "对同一个人的冷却（秒）",
+        "type": "int",
+        "default": 600
+      },
+      "group_cooldown": {
+        "description": "同一个群的冷却（秒）",
+        "type": "int",
+        "default": 60,
+        "hint": "防止群里一热闹就一直戳。"
+      }
+    }
+  },
+  "poke_by_llm": {
+    "description": "场景三：由机器人自己决定",
+    "type": "object",
+    "hint": "给 LLM 注册一个戳一戳工具，它可以自己判断「该戳一下互动」或者在对话里提到某人时戳那个人。",
+    "items": {
+      "enable": {
+        "description": "启用",
+        "type": "bool",
+        "default": true
+      },
+      "cooldown": {
+        "description": "同一个会话的冷却（秒）",
+        "type": "int",
+        "default": 120
+      },
+      "allow_mentioned": {
+        "description": "允许戳消息里 @ 到的人",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，机器人可以戳「本条消息 @ 的人」而不只是发消息的人。"
+      }
+    }
+  },
+  "target": {
+    "description": "戳谁",
+    "type": "object",
+    "items": {
+      "mode": {
+        "description": "默认目标",
+        "type": "string",
+        "options": ["sender", "mentioned_first", "random_member"],
+        "default": "sender",
+        "hint": "sender=发消息的人；mentioned_first=消息里第一个被 @ 的人（没有就退回 sender）；random_member=群里随机一人。"
+      },
+      "ignore_admins": {
+        "description": "不戳群主和管理员",
+        "type": "bool",
+        "default": false
+      }
+    }
+  },
+  "limits": {
+    "description": "频率与范围",
+    "type": "object",
+    "items": {
+      "max_per_hour": {
+        "description": "每会话每小时最多戳几次",
+        "type": "int",
+        "default": 20,
+        "hint": "硬性上限，三个场景共用。QQ 对戳一戳有风控，别设太大。"
+      },
+      "min_interval": {
+        "description": "同一会话两次戳的最小间隔（秒）",
+        "type": "int",
+        "default": 30
+      },
+      "group_whitelist": {
+        "description": "群白名单",
+        "type": "list",
+        "default": [],
+        "hint": "留空表示所有群都生效。"
+      },
+      "group_blacklist": {
+        "description": "群黑名单",
+        "type": "list",
+        "default": []
+      }
+    }
+  },
+  "advanced": {
+    "description": "高级",
+    "type": "object",
+    "items": {
+      "send_method": {
+        "description": "发送方式",
+        "type": "string",
+        "options": ["auto", "segment"],
+        "default": "auto",
+        "hint": "auto=走 OneBot 接口（群聊 group_poke、私聊 friend_poke，失败再试 send_poke）。这是唯一在 NapCat 上有效的方式。segment=把 poke 消息段塞进普通消息发送——NapCat **不支持**这种方式（会被静默丢弃或直接报「消息体无法解析」），只在个别协议端可用。"
+      },
+      "dry_run": {
+        "description": "只记日志不真的戳",
+        "type": "bool",
+        "default": false,
+        "hint": "调参时打开，日志里会显示「本该戳谁、由哪个场景触发、概率是多少」。"
+      }
+    }
+  }
+}

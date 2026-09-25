@@ -1,0 +1,29 @@
+name: astrbot_plugin_proactive_poke
+display_name: 主动戳一戳
+short_desc: 让机器人主动戳一戳别人——回复前、沉默时、以及它自己觉得该戳的时候。
+desc: |
+  适配 NapCat / LLOneBot 等 OneBot v11(aiocqhttp) 协议端。
+
+  三种触发场景，各自独立开关与概率：
+  - 回复前戳：机器人准备回复某人之前，按概率先戳他一下；用时间窗界定「一轮完整对话」，
+    同一会话一轮只会戳一次
+  - 不回复时戳：群里有人发言但没触发回复时，用更低的概率戳他（带用户级与群级冷却）
+  - 交给机器人自己：给 LLM 注册 poke 工具，它可以在觉得合适时戳人，
+    也可以在消息 @ 到某人时戳那个人
+
+  还带全局保护：每会话每小时上限、最小间隔、群白/黑名单、不戳群主管理员、
+  dry-run 调参模式；发送方式在 group_poke / friend_poke / send_poke / poke 消息段之间自动降级。
+
+  支持平台：仅 aiocqhttp（OneBot v11）。
+version: 1.0.0
+author: suwako
+repo: https://github.com/suwa-ko/astrbot_plugin_proactive_poke
+social_link: https://github.com/suwa-ko
+astrbot_version: ">=4.5"
+support_platforms:
+  - aiocqhttp
+tags:
+  - 工具
+  - 群聊
+  - QQ
+  - 互动
